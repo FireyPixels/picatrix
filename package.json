@@ -1,0 +1,22 @@
+{
+    "name": "drawasaurus-image-draw",
+    "version": "1.0.0",
+    "description": "Auto-draw images on Drawasaurus via WebSocket - includes a Node.js CLI tool and a Tampermonkey userscript",
+    "main": "draw_image.js",
+    "scripts": {
+        "start": "node draw_image.js",
+        "draw": "node draw_image.js"
+    },
+    "dependencies": {
+        "sharp": "^0.34.5",
+        "ws": "^8.19.0"
+    },
+    "keywords": [
+        "drawasaurus",
+        "drawing",
+        "websocket",
+        "image",
+        "auto-draw"
+    ],
+    "license": "MIT"
+}
