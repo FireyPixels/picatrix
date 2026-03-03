@@ -5,9 +5,11 @@
     "main": "draw_image.js",
     "scripts": {
         "start": "node draw_image.js",
-        "draw": "node draw_image.js"
+        "draw": "node draw_image.js",
+        "smart": "node draw_smart.js"
     },
     "dependencies": {
+        "g-i-s": "^2.1.7",
         "sharp": "^0.34.5",
         "ws": "^8.19.0"
     },
