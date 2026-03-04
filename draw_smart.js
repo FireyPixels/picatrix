@@ -4,11 +4,12 @@ const path = require('path');
 const https = require('https');
 const http = require('http');
 const gis = require('g-i-s');
+const readline = require('readline');
 
 // ============================================
 //   CONFIGURATION
 // ============================================
-const ROOM_NAME = 'The Puppy Room';
+const ROOM_NAME = 'The Cool Room';
 const USERNAME = 'Mask off';
 const DRAWASAURUS_VERSION = '52a35d2755939386a8de91b399fc0ff770deb697';
 
@@ -276,7 +277,7 @@ async function sendDraw(ws, messages) {
     for (let i = 0; i < messages.length; i++) {
         if (ws.readyState !== WebSocket.OPEN) { console.log(`[Draw] Disconnected at ${i}`); return; }
         ws.send(JSON.stringify(messages[i]));
-        if ((i + 1) % 5 === 0) await new Promise(r => setTimeout(r, 2));
+        if ((i + 1) % 3 === 0) await new Promise(r => setTimeout(r, 4));
         if ((i + 1) % 100 === 0) console.log(`[Draw] Progress: ${i + 1}/${messages.length}`);
     }
     console.log(`[Draw] ALL ${messages.length} messages sent!`);
@@ -388,9 +389,23 @@ Canvas   : ${CANVAS_W}x${CANVAS_H}
                 drawSent = false; autoDrawPromise = null; currentWord = null;
             }
 
+            // Show chat messages from others
+            if (event === 'chatUser') {
+                console.log(`[Chat] ${args[1]}: ${args[0]}`);
+                return;
+            }
+
+            if (event === 'chatNotification') {
+                console.log(`[Chat] * ${args[0]}`);
+                return;
+            }
+
             const silent = ['timerUpdate', 'ping', 'drawLine', 'drawCanvas', 'drawFill',
                 'updateUsers', 'setUsername', 'joinedRoom', 'prepareDrawing',
-                'showWordPicker', 'startDrawing', 'endRound', 'youDrawing'];
+                'showWordPicker', 'startDrawing', 'endRound', 'youDrawing',
+                'connect', 'requestUsername', 'setSession', 'fillCanvas',
+                'skipPlayer', 'updateRound', 'userCorrect', 'revealLetter',
+                'undoLines'];
             if (!silent.includes(event)) console.log(`[Event] ${event}: ${JSON.stringify(args).substring(0, 120)}`);
         } catch (err) { }
     });
@@ -398,7 +413,23 @@ Canvas   : ${CANVAS_W}x${CANVAS_H}
     ws.on('error', (err) => console.error(`[!] Error: ${err.message}`));
     ws.on('close', () => console.log('[!] Disconnected.'));
     setInterval(() => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ a: ["ping"] })); }, 20000);
-    process.on('SIGINT', () => { ws.close(); process.exit(0); });
+
+    // ============================================
+    //   TERMINAL CHAT INPUT
+    // ============================================
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: '' });
+    rl.on('line', (line) => {
+        const msg = line.trim();
+        if (!msg) return;
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ a: ["chat", msg] }));
+            console.log(`[Chat] You: ${msg}`);
+        } else {
+            console.log(`[Chat] Not connected, can't send.`);
+        }
+    });
+
+    process.on('SIGINT', () => { rl.close(); ws.close(); process.exit(0); });
 }
 
 start().catch(err => { console.error('Fatal:', err.message); process.exit(1); });
