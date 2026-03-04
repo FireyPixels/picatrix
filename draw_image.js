@@ -1,6 +1,7 @@
 const WebSocket = require('ws');
 const sharp = require('sharp');
 const path = require('path');
+const readline = require('readline');
 
 // ============================================
 //   CONFIGURATION
@@ -246,9 +247,22 @@ Threshold: ${COLOUR_THRESHOLD}
                 drawSent = false;
             }
 
+            // Show chat messages
+            if (event === 'chatUser') {
+                console.log(`[Chat] ${args[1]}: ${args[0]}`);
+                return;
+            }
+            if (event === 'chatNotification') {
+                console.log(`[Chat] * ${args[0]}`);
+                return;
+            }
+
             const silent = ['timerUpdate', 'ping', 'drawLine', 'drawCanvas', 'drawFill',
                 'updateUsers', 'setUsername', 'joinedRoom', 'prepareDrawing',
-                'showWordPicker', 'startDrawing', 'endRound', 'youDrawing'];
+                'showWordPicker', 'startDrawing', 'endRound', 'youDrawing',
+                'connect', 'requestUsername', 'setSession', 'fillCanvas',
+                'skipPlayer', 'updateRound', 'userCorrect', 'revealLetter',
+                'undoLines'];
             if (!silent.includes(event)) {
                 console.log(`[Event] ${event}: ${JSON.stringify(args).substring(0, 120)}`);
             }
@@ -263,7 +277,22 @@ Threshold: ${COLOUR_THRESHOLD}
         if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ a: ["ping"] }));
     }, 20000);
 
-    process.on('SIGINT', () => { ws.close(); process.exit(0); });
+    // ============================================
+    //   TERMINAL CHAT INPUT
+    // ============================================
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: '' });
+    rl.on('line', (line) => {
+        const msg = line.trim();
+        if (!msg) return;
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ a: ["chat", msg] }));
+            console.log(`[Chat] You: ${msg}`);
+        } else {
+            console.log(`[Chat] Not connected, can't send.`);
+        }
+    });
+
+    process.on('SIGINT', () => { rl.close(); ws.close(); process.exit(0); });
 }
 
 start().catch(err => {
