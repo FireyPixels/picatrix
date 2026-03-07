@@ -3,8 +3,9 @@
 Auto-draw any image on [Drawasaurus](https://www.drawasaurus.org) using the game's WebSocket protocol. Includes three tools:
 
 1. **draw_image.js** -- A Node.js CLI script that joins a room and draws a provided image when it is your turn.
-2. **draw_smart.js** -- An enhanced version with edge-aware two-pass drawing and automatic Google Image Search.
-3. **drawasaurus_dropdraw.user.js** -- A Tampermonkey/Greasemonkey userscript that lets you drag and drop images directly onto the Drawasaurus page to draw them in-game.
+2. **davinci.js** -- An advanced version using a highly optimized region-based algorithm and automatic Google Image Search.
+3. **picasso.js** -- An alternative sophisticated drawing bot that evaluates images using entropy/darkness scoring and simplifies paths using the Ramer-Douglas-Peucker algorithm.
+4. **drawasaurus_dropdraw.user.js** -- A Tampermonkey/Greasemonkey userscript that lets you drag and drop images directly onto the Drawasaurus page to draw them in-game using the Davinci algorithm.
 
 ---
 
@@ -12,10 +13,10 @@ Auto-draw any image on [Drawasaurus](https://www.drawasaurus.org) using the game
 
 All tools convert an image into a series of `drawLine` WebSocket messages that the Drawasaurus server accepts. The image is resized to fit the 880x750 canvas, scanned row by row, and broken into horizontal line segments grouped by colour. Each segment becomes a single draw command sent over the WebSocket connection.
 
-`draw_smart.js` improves on this with a two-pass approach:
-- **Sobel edge detection** identifies colour boundaries in the image.
-- **Fill pass** draws flat colour regions with a thick brush and loose colour threshold.
-- **Edge pass** redraws boundaries with a thin brush and tight colour threshold for crisp outlines.
+`davinci.js` and the DropDraw userscript improve on this with a heavily optimized algorithm that slashes message counts by over 75%:
+- **Connected Component Flood-fill** identifies all connected regions of identical color.
+- **Space-Filling Polylines (Meandering)** generate continuous, snaking brush strokes that color entire regions in single, uninterrupted lines.
+- **Greedy Nearest-Neighbor Edge Packing** mathematically searches for and links nearby edge boundaries into gigantic continuous outlines instead of fragmented line segments.
 
 ---
 
@@ -27,12 +28,12 @@ All tools convert an image into a series of `drawLine` WebSocket messages that t
 ## Setup
 
 ```bash
-git clone <repo-url>
-cd drawasaurus-image-draw
+git clone https://github.com/FireyPixels/picatrix.git
+cd picatrix
 npm install
 ```
 
-Edit the top of `draw_image.js` or `draw_smart.js` to set your `ROOM_NAME` and `USERNAME`.
+Edit the top of `draw_image.js`, `davinci.js`, or `picasso.js` to set your `ROOM_NAME` and `USERNAME`.
 
 ---
 
@@ -47,26 +48,26 @@ node draw_image.js path/to/image.png
 | Variable | Default | Description |
 |---|---|---|
 | `ROOM_NAME` | `'The Cool Room'` | Room to join |
-| `USERNAME` | `'Mask off'` | Display name |
+| `USERNAME` | `'DaVinci'` | Display name |
 | `LINE_THICK` | `5` | Brush thickness (3-16) |
 | `COLOUR_THRESHOLD` | `30` | RGB distance to merge similar colours |
 
 ---
 
-## Node.js CLI -- Smart (`draw_smart.js`)
+## Node.js CLI -- Smart (`davinci.js`)
 
-Two-pass edge-aware drawer with optional automatic image search.
+Two-pass region-filling drawer with optional automatic image search.
 
 ### Manual mode (provide image)
 
 ```bash
-node draw_smart.js path/to/image.png
+node davinci.js path/to/image.png
 ```
 
 ### Auto mode (no image argument)
 
 ```bash
-node draw_smart.js
+node davinci.js
 ```
 
 In auto mode, the script will:
@@ -82,13 +83,14 @@ This repeats every round with whatever word is given.
 
 | Variable | Default | Description |
 |---|---|---|
-| `ROOM_NAME` | `'The Cool Room'` | Room to join |
-| `USERNAME` | `'Mask off'` | Display name |
-| `FILL_THICK` | `7` | Fill pass brush thickness |
-| `FILL_THRESHOLD` | `40` | Fill pass colour merge distance |
-| `EDGE_THICK` | `3` | Edge pass brush thickness |
-| `EDGE_THRESHOLD` | `12` | Edge pass colour merge distance |
-| `SOBEL_THRESHOLD` | `50` | Edge detection sensitivity (lower = more edges) |
+| `ROOM_NAME` | `'The Cool Room2'` | Room to join |
+| `USERNAME` | `'DaVinci'` | Display name |
+| `NUM_COLORS`| `16` | Number of colors to quantize the image into |
+| `FILL_THICK`| `9` | Fill pass brush thickness |
+| `MIN_REGION_PIXELS` | `20` | Ignore regions smaller than this |
+| `EDGE_THICK` | `4` | Edge pass brush thickness |
+| `EDGE_YSTEP` | `4` | Interval for scanning horizontal edge rows |
+| `EDGE_RADIUS`| `3` | Distance from color boundary to trace edges |
 
 ---
 
@@ -110,10 +112,26 @@ This repeats every round with whatever word is given.
 
 ### Features
 
+- Completely executes the massive message-saving Davinci drawing algorithm purely in the browser.
 - Drag and drop image files from your computer.
 - Drag images directly from other browser tabs or Google Images.
 - Local canvas rendering so the drawer can see the result in real time.
 - Status badge with progress counter.
+
+---
+
+## Node.js CLI -- Picasso (`picasso.js`)
+
+An alternative bot that prioritizes drawing sketch-like images (line art, manga, clip art).
+
+```bash
+node picasso.js
+```
+
+**Features:**
+- Uses a path-finding BFS search to identify and ignore backgrounds.
+- Scores candidates from Google Image Search based on pixel entropy, darkness, and aspect ratio.
+- Employs the Ramer-Douglas-Peucker (RDP) algorithm to selectively simplify vectors and fit curves precisely with few points.
 
 ---
 
@@ -122,8 +140,10 @@ This repeats every round with whatever word is given.
 | Package | Purpose |
 |---|---|
 | [ws](https://www.npmjs.com/package/ws) | WebSocket client for Node.js |
-| [sharp](https://www.npmjs.com/package/sharp) | Image loading and resizing |
-| [g-i-s](https://www.npmjs.com/package/g-i-s) | Google Image Search (used by `draw_smart.js` auto mode) |
+| [sharp](https://www.npmjs.com/package/sharp) | Image loading and quantization |
+| [g-i-s](https://www.npmjs.com/package/g-i-s) | Google Image Search (used by `davinci.js`) |
+| [google-img-scrap](https://www.npmjs.com/package/google-img-scrap) | Alternative Google Image search (used by `picasso.js`) |
+| [axios](https://www.npmjs.com/package/axios) | HTTP requests (used by `picasso.js`) |
 
 The Tampermonkey userscript has no external dependencies. It uses the browser's built-in Canvas API for image processing and hooks into the game's existing WebSocket connection.
 
