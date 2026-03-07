@@ -6,10 +6,13 @@
     "scripts": {
         "start": "node draw_image.js",
         "draw": "node draw_image.js",
-        "smart": "node draw_smart.js"
+        "smart": "node draw_smart.js",
+        "picasso": "node picasso.js"
     },
     "dependencies": {
+        "axios": "^1.7.2",
         "g-i-s": "^2.1.7",
+        "google-img-scrap": "^1.1.2",
         "sharp": "^0.34.5",
         "ws": "^8.19.0"
     },
