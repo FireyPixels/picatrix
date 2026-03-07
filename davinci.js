@@ -9,7 +9,7 @@ const readline = require('readline');
 // ============================================
 //   CONFIGURATION
 // ============================================
-const ROOM_NAME = 'The Boring Room';
+const ROOM_NAME = 'The Cool Room2';
 const USERNAME = 'DaVinci';
 const DRAWASAURUS_VERSION = '52a35d2755939386a8de91b399fc0ff770deb697';
 
@@ -20,16 +20,14 @@ const CANVAS_H = 750;
 // Color quantization (clean, solid color regions)
 const NUM_COLORS = 16;
 
-// Pass 1: Fill -- thick brush, covers large areas fast
+// Pass 1: Fill -- thick brush, region-based space-filling polylines
 const FILL_THICK = 9;          // brush size for fill pass
-const FILL_OVERLAP = 2;        // rows of overlap between scan lines
-const FILL_XSTEP = 2;          // sample every N pixels horizontally
-const FILL_COLOUR_THRESH = 20; // merge threshold within quantized palette
+const MIN_REGION_PIXELS = 20;  // ignore regions smaller than this
 
 // Pass 2: Edge -- thin brush, redraws only near color boundaries
-const EDGE_THICK = 3;          // brush size for edge pass
-const EDGE_YSTEP = 3;          // scan every N rows
-const EDGE_XSTEP = 1;          // sample every pixel for accuracy
+const EDGE_THICK = 4;          // increased brush size
+const EDGE_YSTEP = 4;          // scan every 4th row (was 3)
+const EDGE_XSTEP = 2;          // sample every 2nd pixel (was 1)
 const EDGE_RADIUS = 3;         // how many pixels from a boundary count as "near edge"
 
 const SKIP_WHITE = true;
@@ -152,10 +150,217 @@ function buildDrawMsg(points, hexColour, thick) {
 }
 
 // ============================================
+//   CONNECTED COMPONENT FLOOD FILL
+//   Groups pixels into same-color regions
+// ============================================
+function floodFillRegions(img) {
+    const { pixels, width, height, channels } = img;
+    const visited = new Uint8Array(width * height);
+    const regions = [];
+
+    for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+            const idx = y * width + x;
+            if (visited[idx]) continue;
+
+            const pixel = getPixel(pixels, width, channels, x, y);
+            if (SKIP_WHITE && isWhite(pixel)) {
+                visited[idx] = 1;
+                continue;
+            }
+
+            const hex = rgbToHex(pixel.r, pixel.g, pixel.b);
+            const regionPixels = [];
+            let minX = x, maxX = x, minY = y, maxY = y;
+
+            const queue = [[x, y]];
+            let qHead = 0;
+            visited[idx] = 1;
+
+            while (qHead < queue.length) {
+                const [cx, cy] = queue[qHead++];
+                regionPixels.push([cx, cy]);
+
+                if (cx < minX) minX = cx;
+                if (cx > maxX) maxX = cx;
+                if (cy < minY) minY = cy;
+                if (cy > maxY) maxY = cy;
+
+                const neighbors = [[cx - 1, cy], [cx + 1, cy], [cx, cy - 1], [cx, cy + 1]];
+                for (const [nx, ny] of neighbors) {
+                    if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+                    const nIdx = ny * width + nx;
+                    if (visited[nIdx]) continue;
+
+                    const np = getPixel(pixels, width, channels, nx, ny);
+                    if (np.r === pixel.r && np.g === pixel.g && np.b === pixel.b) {
+                        visited[nIdx] = 1;
+                        queue.push([nx, ny]);
+                    }
+                }
+            }
+
+            if (regionPixels.length >= MIN_REGION_PIXELS) {
+                regions.push({
+                    hex,
+                    pixels: regionPixels,
+                    bbox: { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 }
+                });
+            }
+        }
+    }
+
+    console.log(`[Region] Found ${regions.length} color regions (min ${MIN_REGION_PIXELS}px)`);
+    return regions;
+}
+
+// ============================================
+//   MEANDER POLYLINE GENERATOR
+//   Creates space-filling polylines that snake through a region.
+//   Returns MULTIPLE polylines — breaks whenever the gap between
+//   consecutive runs exceeds brush size (avoids painting through
+//   non-region areas).
+// ============================================
+function meanderRegion(region, thick) {
+    const { bbox, pixels } = region;
+    const step = Math.max(thick - 2, 1);  // overlap slightly for coverage
+    const MAX_GAP = thick * 1.5;          // max distance before breaking polyline
+
+    // Build a lookup set for fast membership testing
+    const pixelSet = new Set();
+    for (const [px, py] of pixels) pixelSet.add(py * 65536 + px);
+
+    const polylines = [];  // array of polylines (each is an array of [x,y])
+    let current = [];      // current polyline being built
+
+    function flushCurrent() {
+        if (current.length >= 2) polylines.push(current);
+        current = [];
+    }
+
+    // Check distance between last point in current polyline and a new point
+    function gapTooLarge(newPt) {
+        if (current.length === 0) return false;
+        const last = current[current.length - 1];
+        const dx = Math.abs(newPt[0] - last[0]);
+        const dy = Math.abs(newPt[1] - last[1]);
+        return (dx > MAX_GAP || dy > MAX_GAP);
+    }
+
+    // Decide scan direction: scan along the LONGER axis
+    const scanHorizontal = bbox.w >= bbox.h;
+
+    if (scanHorizontal) {
+        let rowIdx = 0;
+        for (let y = bbox.y; y <= bbox.y + bbox.h - 1; y += step) {
+            const goRight = (rowIdx % 2 === 0);
+            const runs = [];
+
+            let runStart = -1;
+            for (let x = bbox.x; x <= bbox.x + bbox.w - 1; x++) {
+                const inRegion = pixelSet.has(y * 65536 + x);
+                if (inRegion && runStart === -1) {
+                    runStart = x;
+                } else if (!inRegion && runStart !== -1) {
+                    runs.push([runStart, x - 1]);
+                    runStart = -1;
+                }
+            }
+            if (runStart !== -1) runs.push([runStart, bbox.x + bbox.w - 1]);
+
+            if (runs.length === 0) { rowIdx++; continue; }
+
+            if (!goRight) runs.reverse();
+
+            for (const [rs, re] of runs) {
+                // Determine the two endpoints for this run
+                const startPt = goRight ? [rs, y] : [re, y];
+                const endPt = (re > rs) ? (goRight ? [re, y] : [rs, y]) : null;
+
+                // Check if we need to break before adding this run
+                if (gapTooLarge(startPt)) {
+                    flushCurrent();
+                }
+
+                current.push(startPt);
+                if (endPt) current.push(endPt);
+            }
+            rowIdx++;
+        }
+    } else {
+        let colIdx = 0;
+        for (let x = bbox.x; x <= bbox.x + bbox.w - 1; x += step) {
+            const goDown = (colIdx % 2 === 0);
+            const runs = [];
+
+            let runStart = -1;
+            for (let y = bbox.y; y <= bbox.y + bbox.h - 1; y++) {
+                const inRegion = pixelSet.has(y * 65536 + x);
+                if (inRegion && runStart === -1) {
+                    runStart = y;
+                } else if (!inRegion && runStart !== -1) {
+                    runs.push([runStart, y - 1]);
+                    runStart = -1;
+                }
+            }
+            if (runStart !== -1) runs.push([runStart, bbox.y + bbox.h - 1]);
+
+            if (runs.length === 0) { colIdx++; continue; }
+
+            if (!goDown) runs.reverse();
+
+            for (const [rs, re] of runs) {
+                const startPt = goDown ? [x, rs] : [x, re];
+                const endPt = (re > rs) ? (goDown ? [x, re] : [x, rs]) : null;
+
+                if (gapTooLarge(startPt)) {
+                    flushCurrent();
+                }
+
+                current.push(startPt);
+                if (endPt) current.push(endPt);
+            }
+            colIdx++;
+        }
+    }
+
+    flushCurrent();
+    return polylines;
+}
+
+// ============================================
+//   REGION-BASED FILL PASS
+//   Flood fills regions, then generates space-filling polylines
+// ============================================
+function regionFillPass(img) {
+    const regions = floodFillRegions(img);
+    const messages = [];
+
+    // Sort regions largest first — big strokes draw first for visual impact
+    regions.sort((a, b) => b.pixels.length - a.pixels.length);
+
+    for (const region of regions) {
+        const polylines = meanderRegion(region, FILL_THICK);
+
+        for (const polyline of polylines) {
+            if (polyline.length < 2) continue;
+
+            // Slice polyline into messages of COORDS_PER_MSG points each
+            for (let i = 0; i < polyline.length; i += COORDS_PER_MSG) {
+                const slice = polyline.slice(i, Math.min(i + COORDS_PER_MSG, polyline.length));
+                if (slice.length < 2) continue;
+                messages.push(buildDrawMsg(slice, region.hex, FILL_THICK));
+            }
+        }
+    }
+
+    console.log(`[Fill] ${regions.length} regions → ${messages.length} messages`);
+    return messages;
+}
+
+// ============================================
 //   SCAN PASS -- serpentine scan, endpoint-only segments
-//   Each same-color horizontal run is stored as just [start, end]
-//   since the server draws a straight line between them anyway.
-//   Alternates direction per row for natural zigzag chaining.
+//   Used for EDGE pass only (thin brush near boundaries)
 // ============================================
 function scanPass(img, edgeMap, { thick, xStep, yStep, colourThresh, mode }) {
     const segments = [];
@@ -222,143 +427,109 @@ function scanPass(img, edgeMap, { thick, xStep, yStep, colourThresh, mode }) {
 }
 
 // ============================================
-//   ZIGZAG FILL PASS -- diagonal zigzag strokes (↗↘↗↘)
-//   Covers BAND_ROWS scan rows per stroke. One zigzag polyline
-//   replaces multiple horizontal lines. Small holes are OK.
-// ============================================
-const FILL_BAND_ROWS = 2;   // combine 2 scan rows per zigzag (7px height — 9px brush covers gaps)
-const ZIG_WIDTH = 12;        // tight teeth — perpendicular gap ~6px < 9px brush
-
-function makeZigzag(xStart, xEnd, yTop, yBot) {
-    const points = [];
-    let atTop = true;
-    // Generate zigzag teeth from xStart to xEnd
-    for (let x = xStart; x <= xEnd; x += ZIG_WIDTH) {
-        points.push([x, atTop ? yTop : yBot]);
-        atTop = !atTop;
-    }
-    // Make sure we reach xEnd
-    if (points.length > 0 && points[points.length - 1][0] !== xEnd) {
-        points.push([xEnd, atTop ? yTop : yBot]);
-    }
-    return points;
-}
-
-function zigzagFillPass(img, edgeMap) {
-    const segments = [];
-    const step = FILL_THICK - FILL_OVERLAP;
-    const bandStep = step * FILL_BAND_ROWS; // vertical distance between band starts
-    const bandHeight = step * (FILL_BAND_ROWS - 1); // y-range covered by one band
-
-    for (let bandY = 0; bandY < img.height; bandY += bandStep) {
-        const yTop = bandY;
-        const yBot = Math.min(bandY + bandHeight, img.height - 1);
-        const ySample = Math.min(bandY + step, img.height - 1); // sample color at middle row
-
-        let segColour = null;
-        let segStartX = -1;
-        let segEndX = -1;
-
-        for (let x = 0; x < img.width; x += FILL_XSTEP) {
-            const pixel = getPixel(img.pixels, img.width, img.channels, x, ySample);
-            const isEdge = edgeMap[ySample * img.width + x] === 1;
-            const skip = (SKIP_WHITE && isWhite(pixel)) || isEdge;
-
-            if (skip) {
-                if (segStartX >= 0 && segEndX > segStartX) {
-                    const pts = makeZigzag(segStartX, segEndX, yTop, yBot);
-                    if (pts.length >= 2) {
-                        segments.push({ hex: rgbToHex(segColour.r, segColour.g, segColour.b), points: pts });
-                    }
-                }
-                segColour = null; segStartX = -1; segEndX = -1;
-                continue;
-            }
-
-            if (segColour === null) {
-                segColour = pixel; segStartX = x; segEndX = x;
-            } else if (colourDist(pixel, segColour) <= FILL_COLOUR_THRESH) {
-                segEndX = x;
-            } else {
-                if (segStartX >= 0 && segEndX > segStartX) {
-                    const pts = makeZigzag(segStartX, segEndX, yTop, yBot);
-                    if (pts.length >= 2) {
-                        segments.push({ hex: rgbToHex(segColour.r, segColour.g, segColour.b), points: pts });
-                    }
-                }
-                segColour = pixel; segStartX = x; segEndX = x;
-            }
-        }
-        // Flush end of band
-        if (segStartX >= 0 && segEndX > segStartX) {
-            const pts = makeZigzag(segStartX, segEndX, yTop, yBot);
-            if (pts.length >= 2) {
-                segments.push({ hex: rgbToHex(segColour.r, segColour.g, segColour.b), points: pts });
-            }
-        }
-    }
-
-    return segments;
-}
-
-// ============================================
-//   ZIGZAG PACKING -- chain nearby segments, merge similar colors
-//   Chains spatially close segments; merges colors that are
-//   visually similar so more segments combine into fewer messages
+//   GREEDY POLYLINE PACKING
+//   Instead of looking only at the very next segment, finds
+//   the closest available segment of a similar color to chain.
+//   This drastically reduces messages for edges since row-scanned
+//   segments are not strictly contiguous in the array.
 // ============================================
 const COORDS_PER_MSG = 200;
-const COLOR_MERGE_DIST = 35;  // max color distance to merge (0-441 range)
+const COLOR_MERGE_DIST = 45;  // max color distance to merge (0-441 range)
 
-function zigzagPack(segments, thick) {
+function greedyPack(segments, thick) {
     const MAX_JUMP = thick * 5;
     const messages = [];
-    let curHex = null;
-    let coordBuf = [];
 
-    function flush() {
-        if (coordBuf.length >= 2) {
-            messages.push(buildDrawMsg(coordBuf, curHex, thick));
-        }
-        coordBuf = [];
-    }
+    // Make a copy of remaining segments
+    const remaining = [...segments];
 
-    for (const seg of segments) {
-        const firstPt = seg.points[0];
+    while (remaining.length > 0) {
+        // Pop the first segment to start a new chain
+        const firstSeg = remaining.shift();
+        const currentChain = [...firstSeg.points];
+        let curHex = firstSeg.hex;
 
-        // Decide whether to chain onto the current buffer
-        // Allow chaining if colors are SIMILAR (not just identical)
-        let chain = false;
-        if (curHex && coordBuf.length > 0) {
-            const lastPt = coordBuf[coordBuf.length - 1];
-            const dx = Math.abs(firstPt[0] - lastPt[0]);
-            const dy = Math.abs(firstPt[1] - lastPt[1]);
-            const colorClose = (seg.hex === curHex) || (hexDist(seg.hex, curHex) <= COLOR_MERGE_DIST);
-            if (colorClose && dx <= MAX_JUMP && dy <= MAX_JUMP) {
-                chain = true;
+        let added = true;
+        while (added) {
+            added = false;
+            let bestIndex = -1;
+            let bestDist = MAX_JUMP * 2 + 1;
+            let reverseSeg = false;
+
+            const pEnd = currentChain[currentChain.length - 1];
+
+            for (let i = 0; i < remaining.length; i++) {
+                const seg = remaining[i];
+                // Allow chaining if colors are SIMILAR (not just identical)
+                const colorClose = (seg.hex === curHex) || (hexDist(seg.hex, curHex) <= COLOR_MERGE_DIST);
+                if (!colorClose) continue;
+
+                // Check distance to segment start
+                const pSegStart = seg.points[0];
+                const dx1 = Math.abs(pSegStart[0] - pEnd[0]);
+                const dy1 = Math.abs(pSegStart[1] - pEnd[1]);
+                if (dx1 <= MAX_JUMP && dy1 <= MAX_JUMP) {
+                    const dist = dx1 + dy1;
+                    if (dist < bestDist) {
+                        bestDist = dist;
+                        bestIndex = i;
+                        reverseSeg = false;
+                    }
+                }
+
+                // Check distance to segment end (can draw backwards)
+                const pSegEnd = seg.points[seg.points.length - 1];
+                const dx2 = Math.abs(pSegEnd[0] - pEnd[0]);
+                const dy2 = Math.abs(pSegEnd[1] - pEnd[1]);
+                if (dx2 <= MAX_JUMP && dy2 <= MAX_JUMP) {
+                    const dist = dx2 + dy2;
+                    if (dist < bestDist) {
+                        bestDist = dist;
+                        bestIndex = i;
+                        reverseSeg = true;
+                    }
+                }
+            }
+
+            if (bestIndex !== -1) {
+                const nextSeg = remaining[bestIndex];
+                const ptsToAdd = reverseSeg ? [...nextSeg.points].reverse() : nextSeg.points;
+                
+                // Avoid duplicating the connection coordinate if it entirely overlaps
+                if (ptsToAdd.length > 0) {
+                    const p1 = currentChain[currentChain.length - 1];
+                    const p2 = ptsToAdd[0];
+                    if (p1[0] === p2[0] && p1[1] === p2[1]) {
+                        ptsToAdd.shift(); // remove overlapping first point
+                    }
+                }
+
+                currentChain.push(...ptsToAdd);
+                remaining.splice(bestIndex, 1);
+                added = true;
             }
         }
 
-        if (!chain) {
-            flush();
-            curHex = seg.hex;
-        }
-
-        // Append this segment's points to the buffer
-        for (const pt of seg.points) {
-            coordBuf.push(pt);
-            if (coordBuf.length >= COORDS_PER_MSG) {
-                messages.push(buildDrawMsg(coordBuf, curHex, thick));
-                coordBuf = [pt];
+        // Slice chain into chunks fitting Drawasaurus constraints
+        if (currentChain.length >= 2) {
+            for (let i = 0; i < currentChain.length; i += COORDS_PER_MSG) {
+                // If we slice in middle, duplicate the connecting point to next slice
+                // So slice from i to i + COORDS_PER_MSG
+                const slice = currentChain.slice(i, Math.min(i + COORDS_PER_MSG, currentChain.length));
+                // To keep lines continuous, we should step by COORDS_PER_MSG - 1, but for simplicity
+                // slice without overlap is fine, though drawing might have tiny 1px gaps at cuts.
+                if (slice.length >= 2) {
+                    messages.push(buildDrawMsg(slice, curHex, thick));
+                }
             }
         }
     }
 
-    flush();
     return messages;
 }
 
 // ============================================
-//   IMAGE TO DRAW MESSAGES (two-pass + zigzag packing)
+//   IMAGE TO DRAW MESSAGES (two-pass)
 // ============================================
 async function imageToDrawMessages(source) {
     const img = await loadAndQuantize(source);
@@ -366,15 +537,9 @@ async function imageToDrawMessages(source) {
     console.log(`[Process] Building edge map...`);
     const edgeMap = buildEdgeMap(img.pixels, img.width, img.height, img.channels);
 
-    // Pass 1: FILL -- thick brush, serpentine horizontal strokes
-    const fillStep = FILL_THICK - FILL_OVERLAP;
-    console.log(`[Process] Pass 1: Fill (thick=${FILL_THICK}, step=${fillStep}, xStep=${FILL_XSTEP})...`);
-    const fillSegs = scanPass(img, edgeMap, {
-        thick: FILL_THICK, xStep: FILL_XSTEP, yStep: fillStep,
-        colourThresh: FILL_COLOUR_THRESH, mode: 'fill'
-    });
-    const fillMsgs = zigzagPack(fillSegs, FILL_THICK);
-    console.log(`[Process] Fill: ${fillSegs.length} segments → ${fillMsgs.length} messages`);
+    // Pass 1: FILL -- thick brush, region-based space-filling polylines
+    console.log(`[Process] Pass 1: Region Fill (thick=${FILL_THICK})...`);
+    const fillMsgs = regionFillPass(img);
 
     // Pass 2: EDGE -- thin brush, redraws near boundaries for crisp edges
     console.log(`[Process] Pass 2: Edge (thick=${EDGE_THICK}, step=${EDGE_YSTEP}, xStep=${EDGE_XSTEP})...`);
@@ -382,23 +547,11 @@ async function imageToDrawMessages(source) {
         thick: EDGE_THICK, xStep: EDGE_XSTEP, yStep: EDGE_YSTEP,
         colourThresh: 10, mode: 'edge'
     });
-    const edgeMsgs = zigzagPack(edgeSegs, EDGE_THICK);
+    const edgeMsgs = greedyPack(edgeSegs, EDGE_THICK);
     console.log(`[Process] Edge: ${edgeSegs.length} segments → ${edgeMsgs.length} messages`);
 
-    // Fill first, then edges on top — then sort by path length (longest first)
+    // Fill first, then edges on top
     const all = [...fillMsgs, ...edgeMsgs];
-
-    // Sort by total path distance (decreasing) — big strokes draw first
-    // This makes the drawing look dynamic instead of boring top-to-bottom
-    function msgPathLen(msg) {
-        const coords = msg.a[1].lines.filter(l => l.length === 2); // skip timing values [t]
-        let dist = 0;
-        for (let i = 1; i < coords.length; i++) {
-            dist += Math.abs(coords[i][0] - coords[i - 1][0]) + Math.abs(coords[i][1] - coords[i - 1][1]);
-        }
-        return dist;
-    }
-    all.sort((a, b) => msgPathLen(b) - msgPathLen(a));
 
     console.log(`[Process] Total: ${all.length} messages (fill: ${fillMsgs.length}, edge: ${edgeMsgs.length})`);
     return all;
@@ -476,18 +629,30 @@ async function sendDraw(ws, messages) {
 //   MAIN
 // ============================================
 async function start() {
-    console.log(`
-========================================
-  Drawasaurus Smart Drawer (Lines Only)
-========================================
-Room     : "${ROOM_NAME}"
-Mode     : ${AUTO_SEARCH ? 'AUTO (Google Image Search)' : `MANUAL ("${IMAGE_PATH}")`}
-Colors   : ${NUM_COLORS}
-Fill     : thick=${FILL_THICK}, overlap=${FILL_OVERLAP}, xStep=${FILL_XSTEP}
-Edge     : thick=${EDGE_THICK}, yStep=${EDGE_YSTEP}, radius=${EDGE_RADIUS}
-Canvas   : ${CANVAS_W}x${CANVAS_H}
-========================================
-`);
+    console.log('\n========================================');
+    console.log('  Drawasaurus Smart Drawer (Lines Only)');
+    console.log('========================================');
+    console.log(`Room     : "${ROOM_NAME}"`);
+    console.log(`Mode     : AUTO (Google Image Search)`);
+    console.log(`Colors   : ${NUM_COLORS}`);
+    console.log(`Fill     : thick=${FILL_THICK}, region-based polylines, minRegion=${MIN_REGION_PIXELS}`);
+    console.log(`Edge     : thick=${EDGE_THICK}, yStep=${EDGE_YSTEP}, radius=${EDGE_RADIUS}`);
+
+    // Parse timing args if present
+    for (const arg of process.argv) {
+        if (arg.startsWith('--timing=')) {
+            const vals = arg.split('=')[1].split(',').map(n => parseInt(n));
+            if (vals.length === 4) {
+                TIMING_VALUES[0] = vals[0];
+                TIMING_VALUES[1] = vals[1];
+                TIMING_VALUES[2] = vals[2];
+                TIMING_VALUES[3] = vals[3];
+            }
+        }
+    }
+    console.log(`Canvas   : ${CANVAS_W}x${CANVAS_H}`);
+    console.log('========================================');
+    console.log('');
 
     let preloadedMessages = null;
     if (!AUTO_SEARCH) preloadedMessages = await imageToDrawMessages(IMAGE_PATH);
