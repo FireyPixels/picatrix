@@ -9,16 +9,16 @@ const readline = require('readline');
 // ============================================
 //   CONFIGURATION
 // ============================================
-const ROOM_NAME = 'The Cool Room2';
+const ROOM_NAME = 'The Lazy Room';
 const USERNAME = 'DaVinci';
 const DRAWASAURUS_VERSION = '52a35d2755939386a8de91b399fc0ff770deb697';
 
 const IMAGE_PATH = process.argv[2] || '';
-const CANVAS_W = 880;
+const CANVAS_W = 850;
 const CANVAS_H = 750;
 
 // Color quantization (clean, solid color regions)
-const NUM_COLORS = 16;
+const NUM_COLORS = 64;
 
 // Pass 1: Fill -- thick brush, region-based space-filling polylines
 const FILL_THICK = 9;          // brush size for fill pass
@@ -626,52 +626,37 @@ async function sendDraw(ws, messages) {
 }
 
 // ============================================
-//   MAIN
+//   MAIN WEBSOCKET LOGIC
 // ============================================
-async function start() {
-    console.log('\n========================================');
-    console.log('  Drawasaurus Smart Drawer (Lines Only)');
-    console.log('========================================');
-    console.log(`Room     : "${ROOM_NAME}"`);
-    console.log(`Mode     : AUTO (Google Image Search)`);
-    console.log(`Colors   : ${NUM_COLORS}`);
-    console.log(`Fill     : thick=${FILL_THICK}, region-based polylines, minRegion=${MIN_REGION_PIXELS}`);
-    console.log(`Edge     : thick=${EDGE_THICK}, yStep=${EDGE_YSTEP}, radius=${EDGE_RADIUS}`);
+let reconnectAttempts = 0;
+const MAX_RECONNECTS = 10;
+let ws = null;
+let rl = null;
 
-    // Parse timing args if present
-    for (const arg of process.argv) {
-        if (arg.startsWith('--timing=')) {
-            const vals = arg.split('=')[1].split(',').map(n => parseInt(n));
-            if (vals.length === 4) {
-                TIMING_VALUES[0] = vals[0];
-                TIMING_VALUES[1] = vals[1];
-                TIMING_VALUES[2] = vals[2];
-                TIMING_VALUES[3] = vals[3];
-            }
-        }
-    }
-    console.log(`Canvas   : ${CANVAS_W}x${CANVAS_H}`);
-    console.log('========================================');
-    console.log('');
+async function initConnection(preloadedMessages) {
+    return new Promise((resolve, reject) => {
+        const wsUrl = `wss://server.drawasaurus.org/room/${encodeURIComponent(ROOM_NAME)}?version=${DRAWASAURUS_VERSION}`;
+        console.log(`[+] Connecting to "${ROOM_NAME}" (Attempt ${reconnectAttempts + 1})...`);
 
-    let preloadedMessages = null;
-    if (!AUTO_SEARCH) preloadedMessages = await imageToDrawMessages(IMAGE_PATH);
+        ws = new WebSocket(wsUrl, {
+            headers: { 'Origin': 'https://www.drawasaurus.org', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+        });
 
-    const wsUrl = `wss://server.drawasaurus.org/room/${encodeURIComponent(ROOM_NAME)}?version=${DRAWASAURUS_VERSION}`;
-    console.log(`[+] Connecting to "${ROOM_NAME}"...`);
+        let drawSent = false;
+        let currentWord = null;
+        let autoDrawPromise = null;
 
-    const ws = new WebSocket(wsUrl, {
-        headers: { 'Origin': 'https://www.drawasaurus.org', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
-    });
+        const resetState = () => {
+            drawSent = false;
+            autoDrawPromise = null;
+            currentWord = null;
+        };
 
-    let drawSent = false;
-    let currentWord = null;
-    let autoDrawPromise = null;
-
-    ws.on('open', () => {
-        console.log('[+] Connected');
-        ws.send(JSON.stringify({ a: ["submitUsername", USERNAME] }));
-    });
+        ws.on('open', () => {
+            console.log('[+] Connected');
+            reconnectAttempts = 0;
+            ws.send(JSON.stringify({ a: ["submitUsername", USERNAME] }));
+        });
 
     ws.on('message', async (data) => {
         try {
@@ -686,9 +671,15 @@ async function start() {
                 ws.send(JSON.stringify({ a: ["joinRoom", ROOM_NAME, ""] }));
             }
             if (event === 'joinedRoom') {
-                console.log(`[+] In room! ${AUTO_SEARCH ? 'auto-search' : preloadedMessages.length + ' commands ready'}. Waiting for turn...`);
+                console.log(`[+] In room! ${AUTO_SEARCH ? 'auto-search' : (preloadedMessages ? preloadedMessages.length : 0) + ' commands ready'}. Waiting for turn...`);
             }
-            if (event === 'prepareDrawing') console.log(`[Game] Drawer: "${args[0]}"`);
+            if (event === 'prepareDrawing') {
+                console.log(`[Game] Drawer: "${args[0]}"`);
+                resetState();
+            }
+            if (event === 'startingGame' || event === 'practiceMode') {
+                resetState();
+            }
 
             if (event === 'showWordPicker') {
                 try {
@@ -740,7 +731,7 @@ async function start() {
 
             if (event === 'endRound') {
                 console.log('[Game] Round ended');
-                drawSent = false; autoDrawPromise = null; currentWord = null;
+                resetState();
             }
 
             // Show chat messages from others
@@ -754,36 +745,92 @@ async function start() {
                 return;
             }
 
+            // Ping isn't technically silent, we manage heartbeats
             const silent = ['timerUpdate', 'ping', 'drawLine', 'drawCanvas', 'drawFill',
                 'updateUsers', 'setUsername', 'joinedRoom', 'prepareDrawing',
                 'showWordPicker', 'startDrawing', 'endRound', 'youDrawing',
                 'connect', 'requestUsername', 'setSession', 'fillCanvas',
                 'skipPlayer', 'updateRound', 'userCorrect', 'revealLetter',
-                'undoLines'];
+                'undoLines', 'startingGame', 'practiceMode'];
             if (!silent.includes(event)) console.log(`[Event] ${event}: ${JSON.stringify(args).substring(0, 120)}`);
         } catch (err) { }
     });
 
-    ws.on('error', (err) => console.error(`[!] Error: ${err.message}`));
-    ws.on('close', () => console.log('[!] Disconnected.'));
-    setInterval(() => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ a: ["ping"] })); }, 20000);
-
-    // ============================================
-    //   TERMINAL CHAT INPUT
-    // ============================================
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: '' });
-    rl.on('line', (line) => {
-        const msg = line.trim();
-        if (!msg) return;
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ a: ["chat", msg] }));
-            console.log(`[Chat] You: ${msg}`);
-        } else {
-            console.log(`[Chat] Not connected, can't send.`);
-        }
+    ws.on('error', (err) => {
+        console.error(`[!] Error: ${err.message}`);
     });
 
-    process.on('SIGINT', () => { rl.close(); ws.close(); process.exit(0); });
+    ws.on('close', () => {
+        console.log('[!] Disconnected.');
+        resolve(false); // resolve false means reconnect
+    });
+
+    const pingInterval = setInterval(() => { 
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ a: ["ping"] })); 
+    }, 20000);
+
+    // Initial RL setup if not done
+    if (!rl) {
+        rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: '' });
+        rl.on('line', (line) => {
+            const msg = line.trim();
+            if (!msg) return;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ a: ["chat", msg] }));
+                console.log(`[Chat] You: ${msg}`);
+            } else {
+                console.log(`[Chat] Not connected, can't send.`);
+            }
+        });
+        process.on('SIGINT', () => { rl.close(); if(ws) ws.close(); process.exit(0); });
+    }
+
+    // Cleanup interval on disconnect
+    ws.on('close', () => clearInterval(pingInterval));
+  });
+}
+
+async function start() {
+    console.log('\n========================================');
+    console.log('  Drawasaurus Smart Drawer (Lines Only)');
+    console.log('========================================');
+    console.log(`Room     : "${ROOM_NAME}"`);
+    console.log(`Mode     : AUTO (Google Image Search)`);
+    console.log(`Colors   : ${NUM_COLORS}`);
+    console.log(`Fill     : thick=${FILL_THICK}, minRegion=${MIN_REGION_PIXELS}`);
+    console.log(`Edge     : thick=${EDGE_THICK}, radius=${EDGE_RADIUS}`);
+
+    // Parse timing args if present
+    for (const arg of process.argv) {
+        if (arg.startsWith('--timing=')) {
+            const vals = arg.split('=')[1].split(',').map(n => parseInt(n));
+            if (vals.length === 4) {
+                TIMING_VALUES[0] = vals[0];
+                TIMING_VALUES[1] = vals[1];
+                TIMING_VALUES[2] = vals[2];
+                TIMING_VALUES[3] = vals[3];
+            }
+        }
+    }
+    console.log(`Canvas   : ${CANVAS_W}x${CANVAS_H}`);
+    console.log('========================================\n');
+
+    let preloadedMessages = null;
+    if (!AUTO_SEARCH) preloadedMessages = await imageToDrawMessages(IMAGE_PATH);
+
+    while (reconnectAttempts < MAX_RECONNECTS) {
+        const connected = await initConnection(preloadedMessages);
+        if (connected) break; // Should not reach here ordinarily unless graceful exit
+        
+        reconnectAttempts++;
+        if (reconnectAttempts < MAX_RECONNECTS) {
+            console.log(`[!] Reconnecting in 3 seconds...`);
+            await new Promise(r => setTimeout(r, 3000));
+        } else {
+            console.error('[!] Maximum reconnect attempts reached. Exiting.');
+            process.exit(1);
+        }
+    }
 }
 
 start().catch(err => { console.error('Fatal:', err.message); process.exit(1); });
